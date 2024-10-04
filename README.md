@@ -7,3 +7,6 @@ My data science and analytics projects
 3. R Programming
 4. Looker Dashboard
 5. Linear Regression Model using Caret
+
+## Contact Me
+Reach out to me at meaw.sumanta@gmail.com
