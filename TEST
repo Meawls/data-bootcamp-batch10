@@ -1,0 +1,488 @@
+WITH customer_data AS (
+  SELECT 
+      C.case_id, 
+      C.field_name, 
+      C.value,
+      CASE WHEN M.th_text IS NOT NULL THEN M.th_text ELSE C.value END AS map_value
+  FROM (
+      SELECT 
+          case_id, 
+          field_name, 
+          value,
+          lastBatchDate,
+          ROW_NUMBER() OVER (PARTITION BY case_id, field_name ORDER BY lastBatchDate DESC) AS row_num
+      FROM `loxbit-moneydd-bigquery-prod.blockfint.question_taskpool-customer_data`
+  ) C
+  LEFT JOIN `loxbit-moneydd-bigquery-prod.report.los_field-masterdata` M
+      ON C.field_name = M.fieldname AND C.value = M.value
+  WHERE C.row_num = 1
+  AND C.case_id IN (
+      SELECT case_id
+      FROM (
+          SELECT 
+              case_id, 
+              field_name, 
+              value,
+              ROW_NUMBER() OVER (PARTITION BY case_id, field_name ORDER BY lastBatchDate DESC) AS row_num
+          FROM `loxbit-moneydd-bigquery-prod.blockfint.question_taskpool-customer_data`
+      ) SubQ
+      WHERE SubQ.row_num = 1
+      AND SubQ.field_name = '_loan.campaign' 
+      AND SubQ.value = 'normal'
+  )
+),
+
+case_request_dates AS (
+  SELECT 
+    case_id,
+    TIMESTAMP_SECONDS(CAST(value AS INT64)) AS requestDate
+  FROM customer_data
+  WHERE field_name = '_loan.requestDate'
+),
+
+customer_ids AS (
+  SELECT 
+    case_id,
+    MAX(CASE WHEN field_name = '_customerInfo.nationalIdNumber' THEN value END) AS nationalIdNumber
+  FROM customer_data
+  GROUP BY case_id
+),
+
+latest_ncb_by_id AS (
+  SELECT 
+    n.*,
+    crd.requestDate,
+    crd.case_id,
+    ROW_NUMBER() OVER (
+      PARTITION BY n.id_number, crd.case_id 
+      ORDER BY n.update_time DESC
+    ) as rn
+  FROM `report-mdd.credit_collection_risk.ca_ncb_insight` n
+  CROSS JOIN case_request_dates crd
+  INNER JOIN customer_ids ci
+    ON n.id_number = ci.nationalIdNumber
+    AND ci.case_id = crd.case_id
+  WHERE 
+    n.id_number IS NOT NULL
+    AND CAST(n.update_time AS TIMESTAMP) >= 
+        TIMESTAMP_SUB(crd.requestDate, INTERVAL 45 DAY)
+    AND CAST(n.update_time AS TIMESTAMP) <= 
+        crd.requestDate
+),
+
+application_ncb AS (
+  SELECT
+    app_no,
+    id_number,
+    MAX(max_payment_char) AS max_payment_char,
+    MAX(max_payment_char_6m) AS max_payment_char_6m,
+    MAX(max_payment_char_7_12m) AS max_payment_char_7_12m,
+    MAX(max_payment_char_13m_plus) AS max_payment_char_13m_plus,
+    MAX(max_payment_char_open) AS max_payment_char_open,
+    MAX(max_payment_char_6m_open) AS max_payment_char_6m_open,
+    MAX(max_payment_char_7_12m_open) AS max_payment_char_7_12m_open,
+    MAX(max_payment_char_13m_plus_open) AS max_payment_char_13m_plus_open,
+    MAX(max_payment_char_recent) AS max_payment_char_recent,
+    MAX(max_payment_char_6m_recent) AS max_payment_char_6m_recent,
+    MAX(max_payment_char_7_12m_recent) AS max_payment_char_7_12m_recent,
+    MAX(max_payment_char_13m_plus_recent) AS max_payment_char_13m_plus_recent,
+    MAX(max_payment_char_gsb) AS max_payment_char_gsb,
+    MAX(total_open_amount_owed) AS total_open_amount_owed,
+    MAX(total_open_credit_limit) AS total_open_credit_limit,
+    MAX(total_amount_pastdue) AS total_amount_pastdue,
+    MAX(num_open_accounts) AS num_open_accounts,
+    MAX(num_closed_accounts) AS num_closed_accounts,
+    MAX(num_ploan_accounts) AS num_ploan_accounts,
+    MAX(min_payment_history_length_open) AS min_payment_history_length_open,
+    MAX(max_payment_history_length) AS max_payment_history_length,
+    MAX(bankruptcy_status) AS bankruptcy_status,
+    MAX(count_1_first_12m) AS count_1_first_12m,
+    MAX(count_1_first_12m_open) AS count_1_first_12m_open,
+    MAX(count_1_first_12m_recent) AS count_1_first_12m_recent,
+    MAX(is_consecutive_0_6m_overN) AS is_consecutive_0_6m_overN,
+    MAX(accounts_with_max_f) AS accounts_with_max_f,
+    MAX(latest_personal_loan_limit) AS latest_personal_loan_limit,
+    MAX(accounts_with_max_2) AS accounts_with_max_2,
+    MAX(open_accounts_with_installment) AS open_accounts_with_installment,
+    MAX(credit_limit_open_with_installment) AS credit_limit_open_with_installment,
+    MAX(amount_owed_open_with_installment) AS amount_owed_open_with_installment, 
+    MAX(max_payment_char_ploan) AS max_payment_char_ploan, 
+    MAX(ploan_accounts_over_9m_history) AS ploan_accounts_over_9m_history, 
+    MAX(closed_accounts_with_npl) AS closed_accounts_with_npl, 
+    MAX(new_acc_Xdays) AS new_acc_Xdays,
+    MAX(old_closed_accounts_with_npl) AS old_closed_accounts_with_npl,
+    MAX(high_enquiry_no_subsequent_loan_flag) AS high_enquiry_no_subsequent_loan_flag,
+    MAX(total_credit_limit) AS total_credit_limit,
+    MAX(max_latest_payment_char_recent) AS max_latest_payment_char_recent
+  FROM `report-mdd.credit_collection_risk.ca_ncb_insight`
+  GROUP BY app_no,id_number
+),
+
+latest_app_data AS (
+  SELECT 
+    case_id,
+    MAX(CASE WHEN field_name = '_customerInfo.nationalIdNumber' THEN value END) AS nationalIdNumber,
+    MAX(CASE WHEN field_name = '_loan.loanApplicationNumber' THEN value END) AS loanApplicationNumber,
+    PARSE_DATE('%y%m%d', SUBSTR(MAX(CASE WHEN field_name = '_loan.loanApplicationNumber' THEN value END), 4, 6)) AS app_date
+  FROM customer_data
+  GROUP BY case_id
+),
+
+-- New CTE to determine NCB source for each case
+ncb_source_selection AS (
+  SELECT 
+    cd.case_id,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN 'application_ncb'
+      WHEN ncb_id.max_payment_char IS NOT NULL THEN 'id_based_ncb_within_45days'
+      ELSE 'no_ncb_data'
+    END as ncb_data_source,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.id_number
+      ELSE ncb_id.id_number
+    END as ncb_id_number,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char
+      ELSE ncb_id.max_payment_char
+    END as max_payment_char,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_6m
+      ELSE ncb_id.max_payment_char_6m
+    END as max_payment_char_6m,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_7_12m
+      ELSE ncb_id.max_payment_char_7_12m
+    END as max_payment_char_7_12m,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_13m_plus
+      ELSE ncb_id.max_payment_char_13m_plus
+    END as max_payment_char_13m_plus,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_open
+      ELSE ncb_id.max_payment_char_open
+    END as max_payment_char_open,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_6m_open
+      ELSE ncb_id.max_payment_char_6m_open
+    END as max_payment_char_6m_open,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_7_12m_open
+      ELSE ncb_id.max_payment_char_7_12m_open
+    END as max_payment_char_7_12m_open,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_13m_plus_open
+      ELSE ncb_id.max_payment_char_13m_plus_open
+    END as max_payment_char_13m_plus_open,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_recent
+      ELSE ncb_id.max_payment_char_recent
+    END as max_payment_char_recent,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_6m_recent
+      ELSE ncb_id.max_payment_char_6m_recent
+    END as max_payment_char_6m_recent,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_7_12m_recent
+      ELSE ncb_id.max_payment_char_7_12m_recent
+    END as max_payment_char_7_12m_recent,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_13m_plus_recent
+      ELSE ncb_id.max_payment_char_13m_plus_recent
+    END as max_payment_char_13m_plus_recent,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.total_open_amount_owed
+      ELSE ncb_id.total_open_amount_owed
+    END as total_open_amount_owed,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.total_open_credit_limit
+      ELSE ncb_id.total_open_credit_limit
+    END as total_open_credit_limit,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.total_amount_pastdue
+      ELSE ncb_id.total_amount_pastdue
+    END as total_amount_pastdue,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.num_open_accounts
+      ELSE ncb_id.num_open_accounts
+    END as num_open_accounts,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.num_closed_accounts
+      ELSE ncb_id.num_closed_accounts
+    END as num_closed_accounts,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.min_payment_history_length_open
+      ELSE ncb_id.min_payment_history_length_open
+    END as min_payment_history_length_open,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_history_length
+      ELSE ncb_id.max_payment_history_length
+    END as max_payment_history_length,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.bankruptcy_status
+      ELSE ncb_id.bankruptcy_status
+    END as bankruptcy_status,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.count_1_first_12m
+      ELSE ncb_id.count_1_first_12m
+    END as count_1_first_12m,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.count_1_first_12m_open
+      ELSE ncb_id.count_1_first_12m_open
+    END as count_1_first_12m_open,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.count_1_first_12m_recent
+      ELSE ncb_id.count_1_first_12m_recent
+    END as count_1_first_12m_recent,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.accounts_with_max_f
+      ELSE ncb_id.accounts_with_max_f
+    END as accounts_with_max_f,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.latest_personal_loan_limit
+      ELSE ncb_id.latest_personal_loan_limit
+    END as latest_personal_loan_limit,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.accounts_with_max_2
+      ELSE ncb_id.accounts_with_max_2
+    END as accounts_with_max_2,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.num_ploan_accounts
+      ELSE ncb_id.num_ploan_accounts
+    END as num_ploan_accounts,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_gsb
+      ELSE ncb_id.max_payment_char_gsb
+    END as max_payment_char_gsb,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.is_consecutive_0_6m_overN
+      ELSE ncb_id.is_consecutive_0_6m_overN
+    END as is_consecutive_0_6m_overN,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.open_accounts_with_installment
+      ELSE ncb_id.open_accounts_with_installment
+    END as open_accounts_with_installment,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.credit_limit_open_with_installment
+      ELSE ncb_id.credit_limit_open_with_installment
+    END as credit_limit_open_with_installment,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.amount_owed_open_with_installment
+      ELSE ncb_id.amount_owed_open_with_installment
+    END as amount_owed_open_with_installment,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_payment_char_ploan
+      ELSE ncb_id.max_payment_char_ploan
+    END as max_payment_char_ploan,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.ploan_accounts_over_9m_history
+      ELSE ncb_id.ploan_accounts_over_9m_history
+    END as ploan_accounts_over_9m_history,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.closed_accounts_with_npl
+      ELSE ncb_id.closed_accounts_with_npl
+    END as closed_accounts_with_npl,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.new_acc_Xdays
+      ELSE ncb_id.new_acc_Xdays
+    END as new_acc_Xdays,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.old_closed_accounts_with_npl
+      ELSE ncb_id.old_closed_accounts_with_npl
+    END as old_closed_accounts_with_npl,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.high_enquiry_no_subsequent_loan_flag
+      ELSE ncb_id.high_enquiry_no_subsequent_loan_flag
+    END as high_enquiry_no_subsequent_loan_flag,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.total_credit_limit
+      ELSE ncb_id.total_credit_limit
+    END as total_credit_limit,
+    CASE 
+      WHEN ncb_app.max_payment_char IS NOT NULL THEN ncb_app.max_latest_payment_char_recent
+      ELSE ncb_id.max_latest_payment_char_recent
+    END as max_latest_payment_char_recent
+  FROM customer_data cd
+  LEFT JOIN `loxbit-moneydd-bigquery-prod.x10.user_req_credit_line` rcl
+    ON cd.case_id = rcl.case_id
+  LEFT JOIN application_ncb ncb_app
+    ON ncb_app.app_no = rcl.application_number
+  LEFT JOIN latest_ncb_by_id ncb_id
+    ON ncb_id.case_id = cd.case_id
+    AND ncb_id.rn = 1
+  GROUP BY cd.case_id, 
+    ncb_app.max_payment_char, ncb_id.max_payment_char,
+    ncb_app.id_number, ncb_id.id_number,
+    ncb_app.max_payment_char_6m, ncb_id.max_payment_char_6m,
+    ncb_app.max_payment_char_7_12m, ncb_id.max_payment_char_7_12m,
+    ncb_app.max_payment_char_13m_plus, ncb_id.max_payment_char_13m_plus,
+    ncb_app.max_payment_char_open, ncb_id.max_payment_char_open,
+    ncb_app.max_payment_char_6m_open, ncb_id.max_payment_char_6m_open,
+    ncb_app.max_payment_char_7_12m_open, ncb_id.max_payment_char_7_12m_open,
+    ncb_app.max_payment_char_13m_plus_open, ncb_id.max_payment_char_13m_plus_open,
+    ncb_app.max_payment_char_recent, ncb_id.max_payment_char_recent,
+    ncb_app.max_payment_char_6m_recent, ncb_id.max_payment_char_6m_recent,
+    ncb_app.max_payment_char_7_12m_recent, ncb_id.max_payment_char_7_12m_recent,
+    ncb_app.max_payment_char_13m_plus_recent, ncb_id.max_payment_char_13m_plus_recent,
+    ncb_app.total_open_amount_owed, ncb_id.total_open_amount_owed,
+    ncb_app.total_open_credit_limit, ncb_id.total_open_credit_limit,
+    ncb_app.total_amount_pastdue, ncb_id.total_amount_pastdue,
+    ncb_app.num_open_accounts, ncb_id.num_open_accounts,
+    ncb_app.num_closed_accounts, ncb_id.num_closed_accounts,
+    ncb_app.min_payment_history_length_open, ncb_id.min_payment_history_length_open,
+    ncb_app.max_payment_history_length, ncb_id.max_payment_history_length,
+    ncb_app.bankruptcy_status, ncb_id.bankruptcy_status,
+    ncb_app.count_1_first_12m, ncb_id.count_1_first_12m,
+    ncb_app.count_1_first_12m_open, ncb_id.count_1_first_12m_open,
+    ncb_app.count_1_first_12m_recent, ncb_id.count_1_first_12m_recent,
+    ncb_app.accounts_with_max_f, ncb_id.accounts_with_max_f,
+    ncb_app.latest_personal_loan_limit, ncb_id.latest_personal_loan_limit,
+    ncb_app.accounts_with_max_2, ncb_id.accounts_with_max_2,
+    ncb_app.num_ploan_accounts, ncb_id.num_ploan_accounts,
+    ncb_app.max_payment_char_gsb, ncb_id.max_payment_char_gsb,
+    ncb_app.is_consecutive_0_6m_overN, ncb_id.is_consecutive_0_6m_overN,
+    ncb_app.open_accounts_with_installment, ncb_id.open_accounts_with_installment,
+    ncb_app.credit_limit_open_with_installment, ncb_id.credit_limit_open_with_installment,
+    ncb_app.amount_owed_open_with_installment, ncb_id.amount_owed_open_with_installment,
+    ncb_app.max_payment_char_ploan, ncb_id.max_payment_char_ploan,
+    ncb_app.ploan_accounts_over_9m_history, ncb_id.ploan_accounts_over_9m_history,
+    ncb_app.closed_accounts_with_npl, ncb_id.closed_accounts_with_npl,
+    ncb_app.new_acc_Xdays, ncb_id.new_acc_Xdays,
+    ncb_app.old_closed_accounts_with_npl, ncb_id.old_closed_accounts_with_npl,
+    ncb_app.total_credit_limit, ncb_id.total_credit_limit,
+    ncb_app.high_enquiry_no_subsequent_loan_flag, ncb_id.high_enquiry_no_subsequent_loan_flag,
+    ncb_app.max_latest_payment_char_recent, ncb_id.max_latest_payment_char_recent
+)
+
+SELECT
+  cd.case_id,
+  MAX(CASE WHEN field_name = '_loan.requestDate' THEN DATE(DATETIME(TIMESTAMP_SECONDS(CAST(value AS INT64)), 'Asia/Bangkok')) END) AS requestDate,
+  MAX(CASE WHEN field_name = '_loan.requestDate' THEN TIMESTAMP(DATETIME(TIMESTAMP_SECONDS(CAST(value AS INT64)), 'Asia/Bangkok')) END) AS requestDatetime,
+  MAX(IF(field_name = 'thinker.caDecisionDate', DATE(DATETIME(TIMESTAMP_SECONDS(CAST(value AS INT64)), 'Asia/Bangkok')), NULL)) AS approvedDate,
+  MAX(IF(field_name = 'firstName', value, NULL)) AS firstname,
+  MAX(IF(field_name = 'lastName', value, NULL)) AS lastname,
+  MAX(IF(field_name = 'thinker.caComments', map_value ,NULL)) AS ca_comment,
+  MAX(CASE WHEN field_name = '_occupation.type' THEN map_value END) AS occupation,
+  MAX(IF(field_name = '_customerInfo.ageYears', value, NULL)) AS ageYear,
+  MAX(IF(field_name = '_customerInfo.nationalIdNumber', value, NULL)) AS nationalIdNumber,
+  MAX(ncb.ncb_id_number) as ncb_id_number,
+  MAX(CASE WHEN field_name = '_occupation.subType' THEN map_value END) AS occupation_subType,
+  MAX(CASE WHEN field_name = '_occupation.period' THEN map_value END) AS occupation_period,
+  MAX(CASE WHEN field_name = '_occupation.incomeAmount' THEN value END) AS incomeAmount,
+  MAX(CASE WHEN field_name = '_credit.ncbIssuerAmount' THEN value END) AS ncbIssuerAmount,
+  FORMAT('%.2f',MAX(CASE WHEN field_name = '_credit.debtServiceRatio' 
+      THEN CAST(value AS float64) END)) AS debtServiceRatio,
+  MAX(CASE WHEN field_name = '_gsb.aScoreGrade' THEN map_value END) AS aScore,
+  MAX(CASE WHEN field_name = '_credit.ncbGrade' THEN map_value END) AS ncbScore,
+  MAX(IF(field_name = '_credit.loanActiveAccount', value, NULL)) AS loanActiveAccount,
+  MAX(IF(field_name = '_customerInfo.educationLevel', map_value, NULL)) AS educationLevel,
+  MAX(CASE 
+    WHEN ca_name.ca_name IS NOT NULL THEN ca_name.ca_name
+    WHEN IF(field_name = 'thinker.loanResult', value, NULL) LIKE 'R%' THEN 'System'
+    ELSE NULL
+  END) AS approverName,
+  
+  -- NCB fields from source selection
+  MAX(ncb.ncb_data_source) as ncb_data_source,
+  MAX(ncb.max_payment_char) as max_payment_char,
+  MAX(ncb.max_payment_char_6m) as max_payment_char_6m,
+  MAX(ncb.max_payment_char_7_12m) as max_payment_char_7_12m,
+  MAX(ncb.max_payment_char_13m_plus) as max_payment_char_13m_plus,
+  MAX(ncb.max_payment_char_open) as max_payment_char_open,
+  MAX(ncb.max_payment_char_6m_open) as max_payment_char_6m_open,
+  MAX(ncb.max_payment_char_7_12m_open) as max_payment_char_7_12m_open,
+  MAX(ncb.max_payment_char_13m_plus_open) as max_payment_char_13m_plus_open,
+  MAX(ncb.max_payment_char_recent) as max_payment_char_recent,
+  MAX(ncb.max_payment_char_6m_recent) as max_payment_char_6m_recent,
+  MAX(ncb.max_payment_char_7_12m_recent) as max_payment_char_7_12m_recent,
+  MAX(ncb.max_payment_char_13m_plus_recent) as max_payment_char_13m_plus_recent,
+  MAX(ncb.max_latest_payment_char_recent) as max_latest_payment_char_recent,
+  MAX(ncb.total_open_amount_owed) as ncb_total_open_amount_owed,
+  MAX(ncb.total_open_credit_limit) as ncb_total_open_credit_limit,
+  MAX(ncb.total_amount_pastdue) as ncb_total_amount_pastdue,
+  MAX(ncb.total_credit_limit) as ncb_total_credit_limit,
+  MAX(ncb.num_open_accounts) as ncb_num_open_accounts,
+  MAX(ncb.num_closed_accounts) as ncb_num_closed_accounts,
+  MAX(ncb.min_payment_history_length_open) as ncb_min_payment_history_length_open,
+  MAX(ncb.max_payment_history_length) as ncb_max_payment_history_length,
+  MAX(ncb.bankruptcy_status) as ncb_bankruptcy_status,
+  MAX(ncb.count_1_first_12m) as ncb_count_1_first_12m,
+  MAX(ncb.count_1_first_12m_open) as ncb_count_1_first_12m_open,
+  MAX(ncb.count_1_first_12m_recent) as ncb_count_1_first_12m_recent,
+  MAX(ncb.accounts_with_max_f) as ncb_accounts_with_max_f,
+  MAX(ncb.latest_personal_loan_limit) as latest_personal_loan_limit,
+  MAX(ncb.accounts_with_max_2) as ncb_accounts_with_max_2,
+  MAX(ncb.num_ploan_accounts) as ncb_num_ploan_accounts,
+  MAX(ncb.max_payment_char_gsb) as ncb_max_payment_char_gsb,
+  MAX(ncb.is_consecutive_0_6m_overN) as ncb_is_consecutive_0_6m_overN,
+  MAX(ncb.open_accounts_with_installment) as ncb_open_accounts_with_installment,
+  MAX(ncb.credit_limit_open_with_installment) as ncb_credit_limit_open_with_installment,
+  MAX(ncb.amount_owed_open_with_installment) as ncb_amount_owed_open_with_installment,
+  MAX(ncb.max_payment_char_ploan) as ncb_max_payment_char_ploan,
+  MAX(ncb.ploan_accounts_over_9m_history) as ncb_ploan_accounts_over_9m_history,
+  MAX(ncb.closed_accounts_with_npl) as ncb_closed_accounts_with_npl,
+  MAX(ncb.new_acc_Xdays) as ncb_new_acc_Xdays,
+  MAX(ncb.old_closed_accounts_with_npl) as ncb_old_closed_accounts_with_npl,
+  MAX(u.identity_type) AS authenChannel,
+  MAX(u.account_status) AS account_status,
+  MAX(rcl.status) AS rcl_status_mobile,
+  MAX(CASE WHEN field_name = '_loan.loanApplicationNumber' THEN value END) AS loanApplicationNumber,
+  MAX(CASE 
+    WHEN field_name = '_loan.loanType' AND map_value = '7200' THEN 'P-LOAN'
+    WHEN field_name = '_loan.loanType' AND map_value = '7900' THEN 'NANO'
+  END) AS loanType,
+  MAX(CASE WHEN field_name = '_loan.repaymentType' THEN map_value END) AS repaymentType,
+  MAX(CASE WHEN field_name = '_loan.loanRequest' THEN value END) AS loanRequest,
+  MAX(CASE WHEN field_name = '_loan.loanPeriodInMonth' THEN value END) AS loanPeriodInMonth,
+  MAX(CASE WHEN field_name = 'scheduleSettings.fixedDaysOfMonth' THEN value END) AS fixedDaysOfMonth,
+  MAX(CASE WHEN field_name = 'loanAmount' THEN value END) AS loanAmount,
+  MAX(CASE WHEN field_name = 'scheduleSettings.repaymentInstallments' THEN map_value END) AS repaymentInstallments,
+  MAX(CASE WHEN field_name = 'thinker.loanStatus' THEN value END) AS loanStatus,
+  MAX(CASE WHEN field_name = 'thinker.caDecision' THEN value END) AS caDecision,
+  MAX(IF(field_name = 'thinker.loanResult', map_value, NULL)) AS loanResult,
+  MAX(IF(field_name = '_credit.ncbIssueDate', 
+      FORMAT_DATE('%Y-%m-%d', DATE(TIMESTAMP_SECONDS(CAST(map_value AS INT)))),NULL)) AS ncbIssueDate,
+  MAX(IF(field_name = '_credit.isNcbManualTads', map_value, NULL)) AS ncbGradeExtracted,
+  MAX(CASE WHEN field_name = '_documents.4.content' THEN value END) IS NOT NULL AS is_upload_stm,
+
+  MAX(CAST(ROUND(SAFE_CAST(k.avg_income_last_6_month AS NUMERIC), 0) AS INT64)) as avg_income_last_6_month,
+  MAX(k.batch_id) as batch_id,
+  MAX(k.validation_name_match) as validation_name_match,
+  MAX(k.validation_transaction_latest_after_2) as validation_transaction_latest_after_2,
+  MAX(k.validation_transaction_min_month_6) as validation_transaction_min_month_6,
+  MAX(CAST(ROUND(SAFE_CAST(k.avg_monthly_salary AS NUMERIC), 0) AS INT64)) as avg_monthly_salary,
+  MAX(k.longest_consecutive_salary_months) AS longest_consecutive_salary_months,
+  MAX(CAST(ROUND(SAFE_CAST(k.avg_income_last_6_month_exclude_self_transfer AS NUMERIC), 0) AS INT64)) as avg_income_last_6_month_exclude_self_transfer,
+  MAX(k.file_modified) AS file_modified,
+  MAX(k.avg_balance_per_day) AS avg_balance_per_day,
+  MAX(k.monthly_final_balances) AS monthly_final_balances,
+  MAX(k.monthly_avg_balance_per_day) AS monthly_avg_balance_per_day,
+  MAX(k.avg_monthly_wage) AS avg_monthly_wage,
+  MAX(k.avg_monthly_revenue) AS avg_monthly_revenue,
+  MAX(k.longest_consecutive_wage_months) AS longest_consecutive_wage_months,
+  MAX(k.longest_consecutive_revenue_months) AS longest_consecutive_revenue_months,
+
+  MAX(dstm.dstm_avg_credit) AS dstm_avg_credit,
+  MAX(dstm.dstm_consecutive_salary) AS dstm_consecutive_salary,
+  MAX(dstm_avg_salary) AS dstm_avg_salary,
+  MAX(dstm_consecutive_credit) AS dstm_consecutive_credit,
+  MAX(high_enquiry_no_subsequent_loan_flag) AS ncb_high_enquiry_no_subsequent_loan_flag,
+
+FROM 
+  customer_data cd
+LEFT JOIN `loxbit-moneydd-bigquery-prod.x10.user_req_credit_line` rcl
+  ON cd.case_id = rcl.case_id
+LEFT JOIN `loxbit-moneydd-bigquery-prod.x10.user` u
+  ON rcl.user_id = u.user_id
+LEFT JOIN ncb_source_selection ncb
+  ON ncb.case_id = cd.case_id
+LEFT JOIN latest_app_data lad
+  ON cd.case_id = lad.case_id
+LEFT JOIN `report-mdd.uppass_dataset.key_result` k 
+  ON cd.case_id = k.case_id
+LEFT JOIN `report-mdd.credit_collection_risk.dstatement_key_result` dstm
+  ON cd.case_id = dstm.case_id
+LEFT JOIN `loxbit-moneydd-bigquery-prod.report.approver_name` ca_name
+  ON cd.case_id = ca_name.case_id
+GROUP BY cd.case_id, ca_name.ca_name
+HAVING requestDate IS NOT NULL
+ORDER BY requestDate DESC
